@@ -30,14 +30,14 @@ wiwo events --user octocat
 # Last 3 days
 wiwo events --user octocat --time 3d
 
-# Last week
-wiwo events --user octocat --time 1w
+# Last 2 weeks
+wiwo events --user octocat --time 2w
 
-# Last 2 months
-wiwo events --user octocat --time 2m
+# Last 60 days
+wiwo events --user octocat --time 60d
 
-# Last year
-wiwo events --user octocat --time 1y
+# Last 90 days (maximum supported by GitHub API)
+wiwo events --user octocat --time 90d
 ```
 
 Time range format:

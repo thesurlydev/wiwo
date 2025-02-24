@@ -7,8 +7,9 @@ A command-line tool to list GitHub events for a given user.
 Ensure you have Rust installed, then:
 
 ```bash
-cargo build --release
+cargo install --path .
 ```
+This will install the `wiwo` binary in your `$HOME/.cargo/bin` directory.
 
 ## Usage
 

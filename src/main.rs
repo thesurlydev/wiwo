@@ -53,9 +53,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+trait SplitFirstN {
+    type Item;
+    fn split_first_n(&self, n: usize) -> Option<(&[Self::Item], &[Self::Item])>;
+}
+
+impl<T> SplitFirstN for [T] {
+    type Item = T;
+    fn split_first_n(&self, n: usize) -> Option<(&[T], &[T])> {
+        if self.len() >= n {
+            Some((&self[..n], &self[n..]))
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct Repository {
     name: String,
+    html_url: String,
+    private: Option<bool>,
+    clone_url: String,
+    fork: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +177,30 @@ fn parse_time_range(time_str: &str) -> Result<Duration> {
         "y" => Ok(Duration::days(amount * 365)), // Approximate year as 365 days
         _ => anyhow::bail!("Invalid time unit. Use 'd' for days, 'w' for weeks, 'm' for months, or 'y' for years")
     }
+}
+
+async fn fetch_events_from_api(client: &reqwest::Client, headers: &HeaderMap, username: &str, cutoff_time: DateTime<Utc>) -> Result<Vec<Event>> {
+    // Define endpoints - only use direct events since received_events will duplicate activity
+    let mut endpoints = vec![
+        format!("https://api.github.com/users/{}/events/public", username),
+        format!("https://api.github.com/users/{}/events", username),
+    ];
+
+    // Remove private endpoint if no token
+    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+        endpoints.retain(|e| e.contains("/public"));
+    }
+
+    let mut all_events = Vec::new();
+
+    for endpoint in endpoints {
+        match fetch_events_from_endpoint(client, headers, &endpoint, cutoff_time).await {
+            Ok(mut events) => all_events.append(&mut events),
+            Err(e) => eprintln!("Warning: Failed to fetch events from {}: {}", endpoint, e),
+        }
+    }
+    
+    Ok(all_events)
 }
 
 async fn fetch_events_from_endpoint(client: &reqwest::Client, headers: &HeaderMap, endpoint: &str, cutoff_time: DateTime<Utc>) -> Result<Vec<Event>> {
@@ -313,6 +357,71 @@ fn setup_github_client() -> Result<(reqwest::Client, HeaderMap)> {
     Ok((reqwest::Client::new(), headers))
 }
 
+async fn fetch_user_repositories(client: &reqwest::Client, headers: &HeaderMap, username: &str) -> Result<Vec<Repository>> {
+    let mut all_repos = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let url = format!("https://api.github.com/users/{}/repos?type=owner&page={}&per_page=100", username, page);
+        let response = client
+            .get(&url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .context(format!("Failed to fetch repositories for {}", username))?;
+
+        let repos: Vec<Repository> = response.json().await
+            .context("Failed to parse repository response")?;
+
+        if repos.is_empty() {
+            break;
+        }
+
+        all_repos.extend(repos.into_iter().filter(|r| !r.fork));
+        page += 1;
+    }
+
+    Ok(all_repos)
+}
+
+async fn get_git_history(repo_path: &str, since: DateTime<Utc>) -> Result<Vec<Event>> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("log")
+        .arg("--all")
+        .arg("--date=iso-strict")
+        .arg(format!("--since={}", since.format("%Y-%m-%d")))
+        .arg("--pretty=format:%H%n%aI%n%s%n%aN")
+        .output()
+        .await
+        .context("Failed to execute git log")?;
+
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    let mut events = Vec::new();
+
+    for chunk in output_str.split("\n\n") {
+        if let Some((hash, date, subject, author)) = chunk.split('\n').collect::<Vec<_>>().split_first_n(4) {
+            if let Ok(created_at) = DateTime::parse_from_rfc3339(date) {
+                events.push(Event {
+                    r#type: "Push".to_string(),
+                    repo: Repository {
+                        name: repo_path.to_string(),
+                        html_url: String::new(),
+                        private: None,
+                        clone_url: String::new(),
+                        fork: false,
+                    },
+                    created_at: created_at.with_timezone(&Utc),
+                    payload: None,
+                });
+            }
+        }
+    }
+
+    Ok(events)
+}
+
 async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Result<()> {
     let (client, headers) = setup_github_client()?;
     
@@ -331,14 +440,58 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
     // client and headers are now set up above
 
     let duration = parse_time_range(time_range)?;
+    let requested_cutoff = Utc::now() - duration;
     
     // GitHub API only returns events from the last 90 days
     let max_duration = Duration::days(90);
-    let cutoff_time = Utc::now() - max_duration.min(duration);
+    let api_cutoff = Utc::now() - max_duration;
     
-    if duration > max_duration {
-        eprintln!("Note: GitHub API only returns events from the last 90 days. Events before {} will not be shown.", 
-            (Utc::now() - max_duration).format("%Y-%m-%d %H:%M:%S UTC"));
+    // For events within 90 days, use the GitHub Events API
+    let mut all_events = Vec::new();
+    
+    if duration <= max_duration {
+        // If requested duration is within API limits, use that
+        all_events.extend(fetch_events_from_api(&client, &headers, &username, requested_cutoff).await?);
+    } else {
+        // For recent events (last 90 days), use the API
+        all_events.extend(fetch_events_from_api(&client, &headers, &username, api_cutoff).await?);
+        
+        // For older events, use git history
+        eprintln!("Fetching older events from git history (this may take a while)...");
+        
+        // Create temp directory for cloning
+        let temp_dir = tempfile::tempdir()?;
+        
+        // Get all repositories owned by the user
+        let repos = fetch_user_repositories(&client, &headers, &username).await?;
+        
+        for repo in repos {
+            let repo_path = temp_dir.path().join(&repo.name);
+            
+            // Clone repository
+            let output = tokio::process::Command::new("git")
+                .arg("clone")
+                .arg("--no-checkout")
+                .arg("--filter=tree:0")
+                .arg(&repo.clone_url)
+                .arg(&repo_path)
+                .output()
+                .await?;
+                
+            if output.status.success() {
+                // Get git history
+                let mut repo_events = get_git_history(repo_path.to_str().unwrap(), requested_cutoff).await?;
+                
+                // Update event details
+                for event in &mut repo_events {
+                    if let Repository { ref name, .. } = event.repo {
+                        event.repo = repo.clone();
+                    }
+                }
+                
+                all_events.extend(repo_events);
+            }
+        }
     }
     
     println!("\nFetching GitHub events for {} (since {})\n", 

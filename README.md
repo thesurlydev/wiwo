@@ -44,11 +44,18 @@ Time range format:
 - `Xd`: X days (e.g., `30d` for 30 days)
 - `Xw`: X weeks (e.g., `2w` for 2 weeks)
 - `Xm`: X months (e.g., `1m` for 1 month)
-- `Xy`: X years (e.g., `1y` for 1 year)
 
 If no time range is specified, defaults to 30 days.
 
-**Note**: Due to GitHub API limitations, only events from the last 90 days are available. If you specify a longer time range, only events from the most recent 90 days will be shown.
+**Note**: The GitHub Events API only returns events from the last 90 days. For older events, `wiwo` will:
+1. Use the Events API to fetch the most recent 90 days of activity
+2. Clone all repositories owned by the user (using a temporary directory)
+3. Use git history to find commits and other activity from before the 90-day limit
+
+This means that for timeframes longer than 90 days:
+- Initial fetching may take longer due to repository cloning
+- Only events that leave a git history trace will be shown (commits, tags, etc.)
+- Events like issue comments, watches, and follows won't be available beyond 90 days
 
 ### Authentication
 

@@ -53,28 +53,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-trait SplitFirstN {
-    type Item;
-    fn split_first_n(&self, n: usize) -> Option<(&[Self::Item], &[Self::Item])>;
-}
-
-impl<T> SplitFirstN for [T] {
-    type Item = T;
-    fn split_first_n(&self, n: usize) -> Option<(&[T], &[T])> {
-        if self.len() >= n {
-            Some((&self[..n], &self[n..]))
-        } else {
-            None
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct Repository {
     name: String,
+    #[serde(default)]
     html_url: String,
     private: Option<bool>,
+    #[serde(default)]
     clone_url: String,
+    #[serde(default)]
     fork: bool,
 }
 
@@ -90,7 +77,11 @@ struct AuthenticatedUser {
 
 impl Repository {
     fn html_url(&self) -> String {
-        format!("https://github.com/{}", self.name)
+        if !self.html_url.is_empty() {
+            self.html_url.clone()
+        } else {
+            format!("https://github.com/{}", self.name)
+        }
     }
 
     async fn is_private(
@@ -401,10 +392,11 @@ async fn get_git_history(repo_path: &str, since: DateTime<Utc>) -> Result<Vec<Ev
     let mut events = Vec::new();
 
     for chunk in output_str.split("\n\n") {
-        if let Some((hash, date, subject, author)) = chunk.split('\n').collect::<Vec<_>>().split_first_n(4) {
-            if let Ok(created_at) = DateTime::parse_from_rfc3339(date) {
+        let parts: Vec<_> = chunk.split('\n').collect();
+        if parts.len() >= 4 {
+            if let Ok(created_at) = DateTime::parse_from_rfc3339(parts[1]) {
                 events.push(Event {
-                    r#type: "Push".to_string(),
+                    event_type: "Push".to_string(),
                     repo: Repository {
                         name: repo_path.to_string(),
                         html_url: String::new(),
@@ -413,7 +405,6 @@ async fn get_git_history(repo_path: &str, since: DateTime<Utc>) -> Result<Vec<Ev
                         fork: false,
                     },
                     created_at: created_at.with_timezone(&Utc),
-                    payload: None,
                 });
             }
         }
@@ -435,9 +426,9 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
             }
         }
     };
+    
     // Create a cache for repository visibility
     let repo_cache = Arc::new(RwLock::new(HashMap::new()));
-    // client and headers are now set up above
 
     let duration = parse_time_range(time_range)?;
     let requested_cutoff = Utc::now() - duration;
@@ -445,6 +436,13 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
     // GitHub API only returns events from the last 90 days
     let max_duration = Duration::days(90);
     let api_cutoff = Utc::now() - max_duration;
+    
+    println!("
+Fetching GitHub events for {} (since {})
+", 
+        username,
+        requested_cutoff.format("%Y-%m-%d %H:%M:%S UTC")
+    );
     
     // For events within 90 days, use the GitHub Events API
     let mut all_events = Vec::new();
@@ -484,84 +482,24 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
                 
                 // Update event details
                 for event in &mut repo_events {
-                    if let Repository { ref name, .. } = event.repo {
-                        event.repo = repo.clone();
-                    }
+                    event.repo = repo.clone();
                 }
                 
                 all_events.extend(repo_events);
             }
         }
     }
-    
-    println!("\nFetching GitHub events for {} (since {})\n", 
-        username,
-        cutoff_time.format("%Y-%m-%d %H:%M:%S UTC")
-    );
-
-    let mut all_events = Vec::new();
-    let mut _page = 1;
-
-    // Calculate the duration in days
-    let _days = match time_range.chars().last() {
-        Some('d') => duration.num_days(),
-        Some('w') => duration.num_weeks() * 7,
-        Some('m') => duration.num_days(), // Already converted to days in parse_time_range
-        Some('y') => duration.num_days(), // Already converted to days in parse_time_range
-        _ => duration.num_days(),
-    };
-
-    // Define endpoints - only use direct events since received_events will duplicate activity
-    let mut endpoints = vec![
-        format!("https://api.github.com/users/{}/events/public", username),
-        format!("https://api.github.com/users/{}/events", username),
-    ];
-
-    // Remove private endpoint if no token
-    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
-        endpoints.retain(|e| e.contains("/public"));
-    }
-
-    // Fetch events from each endpoint
-    for endpoint in endpoints {
-        match fetch_events_from_endpoint(&client, &headers, &endpoint, cutoff_time).await {
-            Ok(mut events) => {
-                // Filter events by cutoff time
-                events.retain(|event| event.created_at >= cutoff_time);
-                all_events.extend(events);
-            }
-            Err(e) => {
-                eprintln!("Warning: Failed to fetch events from {}: {}", endpoint, e);
-                continue;
-            }
-        }
-
-        // Add a delay between endpoints
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-    }
 
     // Remove duplicates based on created_at and event_type
-    all_events.sort_by(|a, b| {
-        let date_cmp = b.created_at.cmp(&a.created_at);
-        if date_cmp == std::cmp::Ordering::Equal {
-            a.event_type.cmp(&b.event_type)
-        } else {
-            date_cmp
-        }
-    });
-
+    all_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
     all_events.dedup_by(|a, b| {
         a.created_at == b.created_at && 
         a.event_type == b.event_type && 
         a.repo.name == b.repo.name
     });
 
-    // Sort events by date (newest first)
-    all_events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-
     if all_events.is_empty() {
-        println!("No recent events found.");
+        println!("No events found.");
         return Ok(());
     }
 

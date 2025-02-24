@@ -159,33 +159,129 @@ fn parse_time_range(time_str: &str) -> Result<Duration> {
     }
 }
 
-async fn fetch_activity_page(client: &reqwest::Client, headers: &HeaderMap, username: &str, page: u32) -> Result<Vec<Event>> {
-    let url = format!(
-        "https://api.github.com/users/{}/events?page={}&per_page=100",
-        username, page
-    );
+async fn fetch_events_from_endpoint(client: &reqwest::Client, headers: &HeaderMap, endpoint: &str, cutoff_time: DateTime<Utc>) -> Result<Vec<Event>> {
+    // GitHub limits pagination to 10 pages with 100 items per page
+    let mut all_events = Vec::new();
+    let mut page = 1;
+    let max_pages = 10;
 
-    let response = client
-        .get(&url)
-        .headers(headers.clone())
-        .send()
-        .await
-        .context("Failed to fetch GitHub events")?;
+    loop {
+        if page > max_pages {
+            eprintln!("Note: Only showing first {} pages of events due to GitHub API limitations", max_pages);
+            break;
+        }
+        let url = format!("{endpoint}?page={page}&per_page=100");
+        let response = client
+            .get(&url)
+            .headers(headers.clone())
+            .send()
+            .await
+            .context(format!("Failed to fetch events from {}", endpoint))?;
 
-    if response.status() == reqwest::StatusCode::FORBIDDEN {
-        anyhow::bail!("GitHub API rate limit exceeded. Please try again later.");
+        // Check rate limits
+        let remaining = response.headers()
+            .get("x-ratelimit-remaining")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0);
+
+        let reset_time = response.headers()
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|ts| DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or_default())
+            .unwrap_or_default();
+
+        if remaining == 0 {
+            let now = Utc::now();
+            let wait_time = (reset_time - now).num_seconds().max(0) as u64;
+            if wait_time < 3600 { // Only wait if less than an hour
+                eprintln!("Rate limit reached. Waiting {} seconds...", wait_time);
+                tokio::time::sleep(tokio::time::Duration::from_secs(wait_time + 1)).await;
+                continue;
+            } else {
+                eprintln!("Rate limit reset time too far in future ({} seconds)", wait_time);
+                break;
+            }
+        }
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            break;
+        }
+
+        // Get the response text first
+        let text = response.text().await
+            .context(format!("Failed to get response text from {}", endpoint))?;
+
+        // Check if we got an error response
+        if let Ok(error) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(message) = error.get("message").and_then(|m| m.as_str()) {
+                if message.contains("rate limit") {
+                    eprintln!("Rate limit exceeded. Waiting before continuing...");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+                    continue;
+                } else {
+                    eprintln!("API error: {}", message);
+                    break;
+                }
+            }
+        }
+
+        // Try to parse as array first, then as single event
+        let events: Vec<Event> = match serde_json::from_str(&text) {
+            Ok(events) => events,
+            Err(e) => {
+                // If parsing as array fails, try parsing as single event
+                match serde_json::from_str::<Event>(&text) {
+                    Ok(event) => vec![event],
+                    Err(_) => {
+                        // Only show error if response isn't empty
+                        if !text.trim().is_empty() {
+                            eprintln!("Warning: Failed to parse response from {}: {}", endpoint, e);
+                        }
+                        break;
+                    }
+                }
+            }
+        };
+
+        let mut should_break = false;
+
+        if events.is_empty() {
+            // If we get an empty page, check if we have any events before the cutoff
+            // If we do, we can stop. If not, keep going as there might be a gap
+            if page >= 30 { // Try up to 30 pages per endpoint to get more history
+                should_break = true;
+            }
+        } else {
+            // Check if we've reached the cutoff time
+            let reached_cutoff = events.last().map_or(false, |last_event| {
+                last_event.created_at < cutoff_time
+            });
+
+            // Add events to our collection
+            all_events.extend(events);
+
+            if reached_cutoff {
+                should_break = true;
+            }
+        }
+
+        if should_break {
+            break;
+        }
+
+        page += 1;
+
+        // Add a small delay between requests
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
-    let events = response
-        .json()
-        .await
-        .context("Failed to parse GitHub events")?;
-
-    Ok(events)
+    Ok(all_events)
 }
 
 async fn get_authenticated_user(client: &reqwest::Client, headers: &HeaderMap) -> Result<Option<String>> {
-    if let Some(auth_header) = headers.get(reqwest::header::AUTHORIZATION) {
+    if let Some(_auth_header) = headers.get(reqwest::header::AUTHORIZATION) {
         let response = client
             .get("https://api.github.com/user")
             .headers(headers.clone())
@@ -235,7 +331,15 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
     // client and headers are now set up above
 
     let duration = parse_time_range(time_range)?;
-    let cutoff_time = Utc::now() - duration;
+    
+    // GitHub API only returns events from the last 90 days
+    let max_duration = Duration::days(90);
+    let cutoff_time = Utc::now() - max_duration.min(duration);
+    
+    if duration > max_duration {
+        eprintln!("Note: GitHub API only returns events from the last 90 days. Events before {} will not be shown.", 
+            (Utc::now() - max_duration).format("%Y-%m-%d %H:%M:%S UTC"));
+    }
     
     println!("\nFetching GitHub events for {} (since {})\n", 
         username,
@@ -243,10 +347,10 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
     );
 
     let mut all_events = Vec::new();
-    let mut page = 1;
+    let mut _page = 1;
 
     // Calculate the duration in days
-    let days = match time_range.chars().last() {
+    let _days = match time_range.chars().last() {
         Some('d') => duration.num_days(),
         Some('w') => duration.num_weeks() * 7,
         Some('m') => duration.num_days(), // Already converted to days in parse_time_range
@@ -254,82 +358,33 @@ async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Resu
         _ => duration.num_days(),
     };
 
-    // Determine which API endpoints to use based on time range
-    let endpoints = if days <= 90 {
-        // If we have a token, try the private events endpoint first
-        if headers.contains_key(reqwest::header::AUTHORIZATION) {
-            vec![
-                format!("https://api.github.com/users/{}/events", username),
-                format!("https://api.github.com/users/{}/events/public", username)
-            ]
-        } else {
-            vec![format!("https://api.github.com/users/{}/events/public", username)]
-        }
-    } else {
-        // For longer periods, try multiple event types
-        // For longer time periods with token, try all available endpoints
-        if headers.contains_key(reqwest::header::AUTHORIZATION) {
-            vec![
-                format!("https://api.github.com/users/{}/events", username),
-                format!("https://api.github.com/users/{}/events/public", username),
-                format!("https://api.github.com/users/{}/received_events", username)
-            ]
-        } else {
-            vec![
-                format!("https://api.github.com/users/{}/events/public", username),
-                format!("https://api.github.com/users/{}/events", username)
-            ]
-        }
-    };
+    // Define endpoints - only use direct events since received_events will duplicate activity
+    let mut endpoints = vec![
+        format!("https://api.github.com/users/{}/events/public", username),
+        format!("https://api.github.com/users/{}/events", username),
+    ];
 
+    // Remove private endpoint if no token
+    if !headers.contains_key(reqwest::header::AUTHORIZATION) {
+        endpoints.retain(|e| e.contains("/public"));
+    }
+
+    // Fetch events from each endpoint
     for endpoint in endpoints {
-        let mut page = 1;
-        loop {
-            let url = format!("{}?page={}&per_page=100", endpoint, page);
-            
-            let response = client
-                .get(&url)
-                .headers(headers.clone())
-                .send()
-                .await
-                .context(format!("Failed to fetch GitHub events from {}", endpoint))?;
-
-            if response.status() == reqwest::StatusCode::FORBIDDEN {
-                eprintln!("Rate limit reached for {}", endpoint);
-                break;
+        match fetch_events_from_endpoint(&client, &headers, &endpoint, cutoff_time).await {
+            Ok(mut events) => {
+                // Filter events by cutoff time
+                events.retain(|event| event.created_at >= cutoff_time);
+                all_events.extend(events);
             }
-
-            if response.status() == reqwest::StatusCode::NOT_FOUND {
-                break;
-            }
-
-            let events: Vec<Event> = match response.json().await {
-                Ok(events) => events,
-                Err(e) => {
-                    eprintln!("Warning: Failed to parse events from {}: {}", endpoint, e);
-                    break;
-                }
-            };
-
-            if events.is_empty() {
-                break;
-            }
-
-            // Check if the oldest event in this page is already too old
-            if let Some(oldest) = events.last() {
-                if oldest.created_at < cutoff_time {
-                    all_events.extend(events.into_iter().filter(|e| e.created_at > cutoff_time));
-                    break;
-                }
-            }
-
-            all_events.extend(events);
-            page += 1;
-
-            if page > 30 { // Increased limit for better historical coverage
-                break;
+            Err(e) => {
+                eprintln!("Warning: Failed to fetch events from {}: {}", endpoint, e);
+                continue;
             }
         }
+
+        // Add a delay between endpoints
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
 
     // Remove duplicates based on created_at and event_type

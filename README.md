@@ -48,6 +48,8 @@ Time range format:
 
 If no time range is specified, defaults to 30 days.
 
+**Note**: Due to GitHub API limitations, only events from the last 90 days are available. If you specify a longer time range, only events from the most recent 90 days will be shown.
+
 ### Authentication
 
 To access private repositories, get better API rate limits, and use the authenticated user by default, you can set your GitHub token in the environment:

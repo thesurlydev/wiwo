@@ -1,6 +1,6 @@
-# GitHub Events CLI
+# WIWO (What I Worked On)
 
-A command-line tool to list GitHub events for users.
+A command-line tool to list GitHub events for a given user.
 
 ## Installation
 
@@ -15,25 +15,25 @@ cargo build --release
 To list GitHub events for a user:
 
 ```bash
-cargo run -- events --user <github-username> [--time <time-range>]
+wiwo events --user <github-username> [--time <time-range>]
 ```
 
 Examples:
 ```bash
 # Last 30 days (default)
-cargo run -- events --user octocat
+wiwo events --user octocat
 
 # Last 3 days
-cargo run -- events --user octocat --time 3d
+wiwo events --user octocat --time 3d
 
 # Last week
-cargo run -- events --user octocat --time 1w
+wiwo events --user octocat --time 1w
 
 # Last 2 months
-cargo run -- events --user octocat --time 2m
+wiwo events --user octocat --time 2m
 
 # Last year
-cargo run -- events --user octocat --time 1y
+wiwo events --user octocat --time 1y
 ```
 
 Time range format:

@@ -15,9 +15,9 @@ struct Cli {
 enum Commands {
     /// List GitHub events for a user
     Events {
-        /// GitHub username
+        /// GitHub username (defaults to authenticated user if GH_TOKEN is set)
         #[arg(short, long)]
-        user: String,
+        user: Option<String>,
         /// Time range for events (e.g., "30d" for 30 days, "1m" for 1 month)
         #[arg(short, long, default_value = "30d")]
         time: String,
@@ -61,6 +61,11 @@ struct Repository {
 #[derive(Debug, Deserialize)]
 struct RepositoryDetails {
     private: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthenticatedUser {
+    login: String,
 }
 
 impl Repository {
@@ -121,7 +126,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Events { user, time } => fetch_user_events(&user, &time).await?,
+        Commands::Events { user, time } => fetch_user_events(user.as_deref(), &time).await?,
     }
 
     Ok(())
@@ -179,6 +184,22 @@ async fn fetch_activity_page(client: &reqwest::Client, headers: &HeaderMap, user
     Ok(events)
 }
 
+async fn get_authenticated_user(client: &reqwest::Client, headers: &HeaderMap) -> Result<Option<String>> {
+    if let Some(auth_header) = headers.get(reqwest::header::AUTHORIZATION) {
+        let response = client
+            .get("https://api.github.com/user")
+            .headers(headers.clone())
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let user = response.json::<AuthenticatedUser>().await?;
+            return Ok(Some(user.login));
+        }
+    }
+    Ok(None)
+}
+
 fn setup_github_client() -> Result<(reqwest::Client, HeaderMap)> {
     let mut headers = HeaderMap::new();
     headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3+json"));
@@ -196,10 +217,22 @@ fn setup_github_client() -> Result<(reqwest::Client, HeaderMap)> {
     Ok((reqwest::Client::new(), headers))
 }
 
-async fn fetch_user_events(username: &str, time_range: &str) -> Result<()> {
+async fn fetch_user_events(username_arg: Option<&str>, time_range: &str) -> Result<()> {
+    let (client, headers) = setup_github_client()?;
+    
+    // If no username provided, try to get authenticated user
+    let username = match username_arg {
+        Some(name) => name.to_string(),
+        None => {
+            match get_authenticated_user(&client, &headers).await? {
+                Some(user) => user,
+                None => anyhow::bail!("No username provided and no authenticated user found. Please provide a username or set GH_TOKEN.")
+            }
+        }
+    };
     // Create a cache for repository visibility
     let repo_cache = Arc::new(RwLock::new(HashMap::new()));
-    let (client, headers) = setup_github_client()?;
+    // client and headers are now set up above
 
     let duration = parse_time_range(time_range)?;
     let cutoff_time = Utc::now() - duration;

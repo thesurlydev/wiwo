@@ -16,12 +16,15 @@ This will install the `wiwo` binary in your `$HOME/.cargo/bin` directory.
 To list GitHub events for a user:
 
 ```bash
-wiwo events --user <github-username> [--time <time-range>]
+wiwo events [--user <github-username>] [--time <time-range>]
 ```
 
 Examples:
 ```bash
-# Last 30 days (default)
+# Using authenticated user (requires GH_TOKEN)
+wiwo events
+
+# Specific user, last 30 days (default)
 wiwo events --user octocat
 
 # Last 3 days
@@ -47,13 +50,14 @@ If no time range is specified, defaults to 30 days.
 
 ### Authentication
 
-To access private repositories and get better API rate limits, you can set your GitHub token in the environment:
+To access private repositories, get better API rate limits, and use the authenticated user by default, you can set your GitHub token in the environment:
 
 ```bash
 export GH_TOKEN=your_github_token_here
 ```
 
 When a token is provided, the tool will:
+- Use your GitHub account as the default user if --user is not specified
 - Include events from private repositories
 - Access additional event endpoints
 - Have higher API rate limits
